@@ -1,0 +1,186 @@
+name: Terraform CI
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "**.tf"
+      - "**.tfvars.example"
+      - ".github/workflows/terraform.yml"
+
+  push:
+    branches: [main]
+    paths:
+      - "**.tf"
+
+permissions:
+  contents: read
+  pull-requests: write  # needed to post plan output as PR comment
+
+jobs:
+  # ────────────────────────────────────────────────────────────────────
+  # FORMAT CHECK
+  # Fails if any .tf file is not properly formatted
+  # ────────────────────────────────────────────────────────────────────
+  fmt:
+    name: Format Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.7.0"
+
+      - name: Check formatting
+        run: terraform fmt -check -recursive -diff
+
+  # ────────────────────────────────────────────────────────────────────
+  # VALIDATE
+  # Validates all module and environment configurations
+  # ────────────────────────────────────────────────────────────────────
+  validate:
+    name: Validate
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        directory:
+          - modules/vpc
+          - modules/eks
+          - environments/dev
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.7.0"
+
+      - name: Terraform init (no backend)
+        working-directory: ${{ matrix.directory }}
+        run: terraform init -backend=false
+
+      - name: Terraform validate
+        working-directory: ${{ matrix.directory }}
+        run: terraform validate
+
+  # ────────────────────────────────────────────────────────────────────
+  # LINT
+  # tflint checks for AWS-specific issues and style violations
+  # ────────────────────────────────────────────────────────────────────
+  lint:
+    name: TFLint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: terraform-linters/setup-tflint@v4
+        with:
+          tflint_version: v0.50.0
+
+      - name: Init tflint (downloads AWS plugin)
+        run: tflint --init --config=.tflint.hcl
+
+      - name: Run tflint on modules
+        run: |
+          tflint --config=.tflint.hcl --chdir=modules/vpc
+          tflint --config=.tflint.hcl --chdir=modules/eks
+
+      - name: Run tflint on environments
+        run: |
+          tflint --config=.tflint.hcl --chdir=environments/dev
+
+  # ────────────────────────────────────────────────────────────────────
+  # SECURITY SCAN
+  # trivy scans for misconfigurations (unencrypted buckets, open SGs, etc.)
+  # ────────────────────────────────────────────────────────────────────
+  security:
+    name: Security Scan (Trivy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run Trivy on Terraform configs
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: config
+          scan-ref: .
+          format: table
+          exit-code: 1
+          severity: CRITICAL,HIGH
+          skip-dirs: ".terraform"
+
+      - name: Run Trivy SARIF (for GitHub Security tab)
+        uses: aquasecurity/trivy-action@master
+        if: always()
+        with:
+          scan-type: config
+          scan-ref: .
+          format: sarif
+          output: trivy-results.sarif
+          skip-dirs: ".terraform"
+
+      - name: Upload SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-results.sarif
+
+  # ────────────────────────────────────────────────────────────────────
+  # PLAN (on PR only, requires AWS credentials in GitHub Secrets)
+  # Posts the plan output as a PR comment
+  # ────────────────────────────────────────────────────────────────────
+  plan:
+    name: Terraform Plan
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    needs: [fmt, validate, lint, security]
+
+    # !! Configure these secrets in your GitHub repo settings !!
+    # Settings → Secrets → Actions:
+    #   AWS_ROLE_ARN: arn:aws:iam::ACCOUNT:role/github-actions-role
+    # Use OIDC (no static keys) — see setup instructions in README
+    permissions:
+      id-token: write  # For OIDC
+      contents: read
+      pull-requests: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ap-south-1
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.7.0"
+
+      - name: Terraform init
+        working-directory: environments/dev
+        run: terraform init
+
+      - name: Terraform plan
+        id: plan
+        working-directory: environments/dev
+        run: |
+          terraform plan -no-color -out=tfplan 2>&1 | tee plan_output.txt
+          echo "exitcode=${PIPESTATUS[0]}" >> $GITHUB_OUTPUT
+        continue-on-error: true
+
+      - name: Post plan as PR comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const plan = fs.readFileSync('environments/dev/plan_output.txt', 'utf8');
+            const truncated = plan.length > 60000
+              ? plan.substring(0, 60000) + '\n...(truncated)'
+              : plan;
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `## Terraform Plan — dev environment\n\`\`\`hcl\n${truncated}\n\`\`\``
+            });
